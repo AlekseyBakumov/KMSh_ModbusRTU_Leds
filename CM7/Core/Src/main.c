@@ -32,7 +32,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 
-#define RECEIVE_TIMEOUT         8999 // 5000 ticks at 25/5 MHz = 0,0002 sec.
+#define RECEIVE_TIMEOUT         8999 // 5000(4999 ARR) ticks at 25/25 MHz = 0,001 sec.
 #define MODBUS_DEVICE_ID        0x01
 
 /* DUAL_CORE_BOOT_SYNC_SEQUENCE: Define for dual core boot synchronization    */
@@ -67,6 +67,8 @@ UART_HandleTypeDef huart1;
 /* USER CODE BEGIN PV */
 ModbusRTU_Handle_t hmodbus1;
 
+uint8_t new_uart_message = 0;
+
 uint8_t test_response[16]  = {0x01, 0x03, 0x02, 0x00, 0x19, 0x79, 0x8E};
 uint8_t rx_temp;
 uint8_t uart_buffer[256];
@@ -75,13 +77,15 @@ uint16_t uart_index = 0;
 ModbusRTU_Package_t received;
 
 uint8_t enabled_leds[8] = {0,0,0,0,0,0,0,0};
-uint8_t blinking[8]     = {0,0,0,0,0,0,0,0};
+uint8_t leds_mode[8]    = {0,0,0,0,0,0,0,0};
 
 uint16_t brightness[8] = {100, 100, 100, 100, 100, 100, 100, 100};
 uint16_t intervals[8]  = {1000,1000,1000,1000,1000,1000,1000,1000};
 
 uint8_t pwm_counter = 0;
 uint32_t blink_counter = 0;
+
+uint8_t current_brightness = 100;
 
 uint16_t LED_PIN[8] = {GPIO_PIN_4, GPIO_PIN_5, GPIO_PIN_6, GPIO_PIN_1, GPIO_PIN_2, GPIO_PIN_11, GPIO_PIN_12, GPIO_PIN_13};
 GPIO_TypeDef* LED_PORT[8] = {GPIOA, GPIOA, GPIOA, GPIOB, GPIOB, GPIOF, GPIOF, GPIOF};
@@ -149,11 +153,15 @@ void UartTimer_Prolong() {
     SET_BIT(htim1.Instance->CR1, TIM_CR1_CEN);
 }
 
+void Uart_Read_byte() {
+  // Should I put uart byte recieved interruption code here?
+}
+
 void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     if (huart->Instance == USART1) {
       
         UartTimer_Prolong();
-      
+        
         uart_buffer[uart_index++] = rx_temp;
         
         HAL_UART_Receive_IT(huart, &rx_temp, 1);
@@ -162,11 +170,15 @@ void HAL_UART_RxCpltCallback(UART_HandleTypeDef *huart) {
     }
 }
 
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
-    if (htim->Instance == TIM1) {
-      load_uart_message(&hmodbus1, uart_buffer, uart_index);
-      
-      if (process_Request(&hmodbus1) == PROCESS_OK) {
+/**
+  * @brief  Is called every cycle in main while(1)
+  * @retval none
+  */
+void On_Transmittion_End() {
+  if (new_uart_message == 0) return;
+  new_uart_message = 0;
+  
+  if (process_Request(&hmodbus1) == PROCESS_OK) {
       
         uint8_t out_len;
         uint8_t* output_buffer = get_Output(&hmodbus1, &out_len);
@@ -191,13 +203,13 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
             
       HAL_GPIO_WritePin(GPIOK, GPIO_PIN_1, GPIO_PIN_RESET);
       HAL_GPIO_WritePin(GPIOK, GPIO_PIN_0, GPIO_PIN_SET);
-    }
-    
-    if (htim->Instance == TIM3) {
-      pwm_counter++;
-      if (pwm_counter > 100) pwm_counter = 0;
-      blink_counter++;
-      if (blink_counter > 100000) blink_counter = 0;
+} 
+
+/**
+  * @brief  Is called every cycle in main while(1)
+  * @retval none
+  */
+void LEDs_Update() {
       
       for (int i = 0; i < 8; i++) {
         if (enabled_leds[i] == 0) {
@@ -205,19 +217,39 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
           continue;
         }
         
-        if (blinking[i]) {
+        if (leds_mode[i] == 1) {
           if (intervals[i] > ((blink_counter/10) % (2 * intervals[i]))) {
             LED_PORT[i]->BSRR = (uint32_t)LED_PIN[i] << 16;
             continue;
           }
         }
         
-        if (pwm_counter < brightness[i]) {
+        if (leds_mode[i] == 2) {
+          current_brightness = ((blink_counter/10) % intervals[i]) * 200 / intervals[i];
+          if (current_brightness > 100) current_brightness = 200 - current_brightness;
+        }
+        else {
+          current_brightness = brightness[i];
+        }
+        
+        if (pwm_counter < current_brightness) {
           LED_PORT[i]->BSRR = LED_PIN[i];
         } else {
           LED_PORT[i]->BSRR = (uint32_t)LED_PIN[i] << 16;
         }
       }
+}
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim) {
+    if (htim->Instance == TIM1) {
+      load_uart_message(&hmodbus1, uart_buffer, uart_index);
+      new_uart_message = 1;
+    }
+    
+    if (htim->Instance == TIM3) {
+      pwm_counter++;
+      blink_counter++;
+      if (pwm_counter > 100) pwm_counter = 0;
     }
 }
 
@@ -259,10 +291,6 @@ uint8_t registers_Mapping_Read(uint16_t addr, uint16_t* val, uint8_t mode) {
         *val = enabled_leds[addr];
         return 0;
       }
-      if (addr >= 0x0010 && addr <= 0x0017) {
-        *val = blinking[addr-16];
-        return 0;
-      }
       return 2;
       
   case READ_MODE_DISCRETE_INP: // 0x02
@@ -281,6 +309,10 @@ uint8_t registers_Mapping_Read(uint16_t addr, uint16_t* val, uint8_t mode) {
       }
       if (addr >= 0x0010 && addr <= 0x0017) {
         *val = intervals[addr-16];
+        return 0;
+      }
+      if (addr >= 0x0020 && addr <= 0x0027) {
+        *val = leds_mode[addr-32];
         return 0;
       }
       return 2;
@@ -337,10 +369,6 @@ uint8_t registers_Mapping_Write(uint16_t addr, uint16_t val, uint8_t mode) {
         enabled_leds[addr] = val == 0xFF00;
         return 0;
       }
-      if (addr >= 0x0010 && addr <= 0x0017) {
-        blinking[addr-16] = val == 0xFF00;
-        return 0;
-      }
       return 2;
     
   case WRITE_MODE_SINGLE_REG: // 0x06
@@ -352,6 +380,10 @@ uint8_t registers_Mapping_Write(uint16_t addr, uint16_t val, uint8_t mode) {
       if (addr >= 0x0010 && addr <= 0x0017) {
         if (val > 5000) return 3;
         intervals[addr-16] = val;
+        return 0;
+      }
+      if (addr >= 0x0020 && addr <= 0x0027) {
+        leds_mode[addr-32] = val;
         return 0;
       }
       return 2;
@@ -455,6 +487,8 @@ timeout = 0xFFFF;
   while (1)
   {
     HAL_GPIO_TogglePin(GPIOC, GPIO_PIN_9);
+    On_Transmittion_End();
+    LEDs_Update();
     
     /* USER CODE END WHILE */
 
